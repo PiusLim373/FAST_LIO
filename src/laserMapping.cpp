@@ -40,7 +40,6 @@
 #include <csignal>
 #include <chrono>
 #include <unistd.h>
-#include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
@@ -486,6 +485,11 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
+// Guards pcl_wait_pub, which is appended to + serialised by publish_map() on the default
+// callback group and deep-copied by save_to_pcd() on the map_save service's own group.
+// Deliberately NOT mtx_buffer: that guards the lidar/IMU deques, and coupling the save to the
+// sensor callbacks would reintroduce exactly the stall this separation removes.
+std::mutex mtx_pcl_wait_pub;
 void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
 {
     if(scan_pub_en)
@@ -590,10 +594,14 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
         RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
                             &laserCloudWorld->points[i]);
     }
-    *pcl_wait_pub += *laserCloudWorld;
-
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
+    {
+        // Held across the append AND the serialise: save_to_pcd() deep-copies this buffer
+        // from another thread, and += can reallocate underneath it.
+        std::lock_guard<std::mutex> lock(mtx_pcl_wait_pub);
+        *pcl_wait_pub += *laserCloudWorld;
+        pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
+    }
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
     laserCloudmsg.header.frame_id = "camera_init";
@@ -606,10 +614,30 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     // pubLaserCloudMap->publish(laserCloudMap);
 }
 
-void save_to_pcd()
+// Snapshot the map, then write it OUTSIDE the lock.
+//
+// writeBinary is slow for two reasons: it strips the padding fields (48 -> 32 B/pt) so it
+// copies field by field, and it then pushes ~150 MB+ to disk. Holding either the lock or the
+// executor thread for that long starves the sensor callbacks -- the IMU queue drops, the EKF
+// ends up propagating across a multi-second dt, and the whole state diverges (the ~100 m
+// camera_init->body jump). So the lock covers only the deep copy, tens of ms at these sizes.
+//
+// The copy cannot be optimised into a pointer swap or a shared_ptr alias: publish_map() keeps
+// appending, so a swap would restart /Laser_map from empty and leave a second save holding
+// only the points since the first, while an alias would have the writer reading a cloud that
+// reallocates underneath it.
+//
+// Returns the number of points written so the caller can report it.
+size_t save_to_pcd()
 {
+    PointCloudXYZI snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mtx_pcl_wait_pub);
+        snapshot = *pcl_wait_pub;
+    }
     pcl::PCDWriter pcd_writer;
-    pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
+    pcd_writer.writeBinary(map_file_path, snapshot);
+    return snapshot.size();
 }
 
 template<typename T>
@@ -926,7 +954,12 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        // Depth 2000, not upstream's 10. At any realistic IMU rate 10 is a few tens of
+        // milliseconds, which leaves no margin for ANY executor hiccup -- and dropped IMU is
+        // not a small degradation here: sync_packages then hands UndistortPcl samples
+        // separated by far more than the nominal dt, and the EKF propagation diverges.
+        // ~600 KB of buffer for several seconds of cover.
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 2000, imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -942,7 +975,13 @@ public:
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
-        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+        // Own callback group so the (deliberately blocking) save runs on its own executor
+        // thread instead of freezing the 100 Hz mapping loop and the sensor callbacks.
+        // Everything else stays in the default MutuallyExclusive group and therefore stays
+        // serialised exactly as it was under the old single-threaded spin() -- only this
+        // service gains concurrency. Requires the MultiThreadedExecutor in main().
+        save_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2), rclcpp::ServicesQoS(), save_cb_group_);
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -1117,9 +1156,20 @@ private:
         RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
         if (pcd_save_en)
         {
-            save_to_pcd();
+            // Intentionally blocking: the caller learns from the response that the file is
+            // actually on disk. It no longer blocks the estimator -- see save_cb_group_.
+            const auto t0 = std::chrono::steady_clock::now();
+            const size_t n = save_to_pcd();
+            const double secs = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+
             res->success = true;
-            res->message = "Map saved.";
+            res->message = "Saved " + std::to_string(n) + " points to " + map_file_path +
+                           " in " + std::to_string(secs) + " s";
+            // Watch this number: it is the signal for whether the copy window is growing into
+            // a problem on long runs.
+            RCLCPP_INFO(this->get_logger(), "Saved %zu points to %s in %.2f s",
+                        n, map_file_path.c_str(), secs);
         }
         else
         {
@@ -1142,6 +1192,7 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
+    rclcpp::CallbackGroup::SharedPtr save_cb_group_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
     bool effect_pub_en = false, map_pub_en = false;
@@ -1160,7 +1211,21 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+    // MultiThreadedExecutor, 2 threads: one for the default MutuallyExclusive group (the
+    // 100 Hz mapping timer, both sensor subscriptions, the 1 Hz map publish -- all still
+    // serialised against each other exactly as under the old spin()), and one for the
+    // map_save service's own group. Two mutually-exclusive groups cannot use more than two
+    // threads, so there is nothing to gain from a larger pool.
+    //
+    // Ctrl-C during a save is safe without extra work: SigHandle calls rclcpp::shutdown(),
+    // and MultiThreadedExecutor::spin() joins its worker threads before returning, so an
+    // in-flight write completes rather than being truncated.
+    {
+        auto node = std::make_shared<LaserMappingNode>();
+        rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+        executor.add_node(node);
+        executor.spin();
+    }
 
     if (rclcpp::ok())
         rclcpp::shutdown();
