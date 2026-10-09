@@ -39,6 +39,9 @@
 #include <fstream>
 #include <csignal>
 #include <chrono>
+#include <algorithm>
+#include <cstring>
+#include <unordered_set>
 #include <unistd.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
@@ -53,6 +56,7 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
@@ -88,6 +92,7 @@ string map_file_path, lid_topic, imu_topic;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
+double lidar_arrival = 0.0, imu_arrival = 0.0, last_sync_wall = 0.0;  // omp_get_wtime(), for the stall log
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
@@ -282,6 +287,7 @@ void lasermap_fov_segment()
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
     mtx_buffer.lock();
+    lidar_arrival = omp_get_wtime();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
@@ -310,6 +316,7 @@ bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
     mtx_buffer.lock();
+    lidar_arrival = omp_get_wtime();
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
@@ -363,10 +370,11 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     double timestamp = get_time_sec(msg->header.stamp);
 
     mtx_buffer.lock();
+    imu_arrival = omp_get_wtime();
 
     if (timestamp < last_timestamp_imu)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
+        std::cerr << "imu loop back, clear buffer" << std::endl;
         imu_buffer.clear();
     }
 
@@ -485,11 +493,18 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-// Guards pcl_wait_pub, which is appended to + serialised by publish_map() on the default
+// Guards pcl_wait_pub, which is appended to by publish_map() on the default
 // callback group and deep-copied by save_to_pcd() on the map_save service's own group.
 // Deliberately NOT mtx_buffer: that guards the lidar/IMU deques, and coupling the save to the
 // sensor callbacks would reintroduce exactly the stall this separation removes.
 std::mutex mtx_pcl_wait_pub;
+// /downsampled_fastlio_map: starting voxel, point budget, and when to resend it.
+double map_leaf_size = 0.1;      // m
+int map_max_points = 200000;     // over this, the voxel grows by map_leaf_growth
+double map_leaf_growth = 1.25;   // voxel growth per budget overflow
+int map_min_new_points = 1000;   // resend once this many new points ...
+double map_min_period = 5.0;     // s ... and at least this long since the last send,
+double map_max_period = 30.0;    // s or after this long if anything is new
 void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
 {
     if(scan_pub_en)
@@ -582,8 +597,23 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
-void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
+// Packed on the wire as is: 16 B/pt, against 32 B for pcl::PointXYZI, half of it padding.
+struct MapPoint { float x, y, z, intensity; };
+static_assert(sizeof(MapPoint) == 16, "MapPoint must stay packed");
+
+struct MapStats { size_t points; double leaf; size_t sent; };
+
+// Appends the current scan to pcl_wait_pub (full resolution, for /map_save) and folds it into a
+// voxel map (first point per voxel), resent only once it has grown enough -- see map_min_*.
+MapStats publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
 {
+    static std::unordered_set<uint64_t> voxels;
+    static std::vector<MapPoint> ds_map;
+    static double leaf = map_leaf_size;
+    static size_t pending = 0, sent = 0;
+    static bool rebuilt = false;
+    static double last_pub = -1e9;
+
     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
     int size = laserCloudFullRes->points.size();
     PointCloudXYZI::Ptr laserCloudWorld( \
@@ -594,24 +624,69 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
         RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
                             &laserCloudWorld->points[i]);
     }
-    sensor_msgs::msg::PointCloud2 laserCloudmsg;
     {
-        // Held across the append AND the serialise: save_to_pcd() deep-copies this buffer
-        // from another thread, and += can reallocate underneath it.
         std::lock_guard<std::mutex> lock(mtx_pcl_wait_pub);
         *pcl_wait_pub += *laserCloudWorld;
-        pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     }
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
-    pubLaserCloudMap->publish(laserCloudmsg);
 
-    // sensor_msgs::msg::PointCloud2 laserCloudMap;
-    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
-    // pubLaserCloudMap->publish(laserCloudMap);
+    // 21 bits per axis.
+    auto key = [](double inv, float x, float y, float z) {
+        auto cell = [inv](float v) { return uint64_t(int64_t(std::floor(v * inv)) + (1 << 20)) & 0x1FFFFF; };
+        return (cell(x) << 42) | (cell(y) << 21) | cell(z);
+    };
+    const double inv = 1.0 / leaf;
+    for (const auto & p : laserCloudWorld->points)
+    {
+        if (!voxels.insert(key(inv, p.x, p.y, p.z)).second) continue;
+        ds_map.push_back({p.x, p.y, p.z, p.intensity});
+        pending++;
+    }
+
+    // Over budget: grow the voxel and refold the map at it until it fits.
+    while (ds_map.size() > static_cast<size_t>(map_max_points))
+    {
+        const size_t before = ds_map.size();
+        const double prev = leaf;
+        leaf *= map_leaf_growth;
+        const double coarse_inv = 1.0 / leaf;
+        std::vector<MapPoint> coarse;
+        voxels.clear();
+        for (const auto & q : ds_map)
+            if (voxels.insert(key(coarse_inv, q.x, q.y, q.z)).second) coarse.push_back(q);
+        ds_map.swap(coarse);
+        rebuilt = true;
+        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                    "downsampled map over budget: leaf %.3f -> %.3f m, %zu -> %zu pts",
+                    prev, leaf, before, ds_map.size());
+    }
+
+    const double now = omp_get_wtime();
+    const double since = now - last_pub;
+    const bool due =
+        ((pending >= static_cast<size_t>(map_min_new_points) || rebuilt) && since >= map_min_period) ||
+        (pending > 0 && since >= map_max_period);
+    if (due)
+    {
+        sensor_msgs::msg::PointCloud2 msg;
+        sensor_msgs::PointCloud2Modifier mod(msg);
+        mod.setPointCloud2Fields(4,
+            "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+            "intensity", 1, sensor_msgs::msg::PointField::FLOAT32);
+        msg.height = 1;
+        mod.resize(ds_map.size());
+        std::memcpy(msg.data.data(), ds_map.data(), ds_map.size() * sizeof(MapPoint));
+        msg.is_dense = true;
+        msg.header.stamp = get_ros_time(lidar_end_time);
+        msg.header.frame_id = "camera_init";
+        pubLaserCloudMap->publish(msg);
+        pending = 0;
+        rebuilt = false;
+        last_pub = now;
+        sent++;
+    }
+    return {ds_map.size(), leaf, sent};
 }
 
 // Snapshot the map, then write it OUTSIDE the lock.
@@ -623,7 +698,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
 // camera_init->body jump). So the lock covers only the deep copy, tens of ms at these sizes.
 //
 // The copy cannot be optimised into a pointer swap or a shared_ptr alias: publish_map() keeps
-// appending, so a swap would restart /Laser_map from empty and leave a second save holding
+// appending, so a swap would restart the saved map from empty and leave a second save holding
 // only the points since the first, while an alias would have the writer reading a cloud that
 // reallocates underneath it.
 //
@@ -829,6 +904,12 @@ public:
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
+        this->declare_parameter<double>("publish.map_leaf_size", 0.1);
+        this->declare_parameter<int>("publish.map_max_points", 200000);
+        this->declare_parameter<double>("publish.map_leaf_growth", 1.25);
+        this->declare_parameter<int>("publish.map_min_new_points", 1000);
+        this->declare_parameter<double>("publish.map_min_period", 5.0);
+        this->declare_parameter<double>("publish.map_max_period", 30.0);
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
@@ -865,6 +946,15 @@ public:
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
+        this->get_parameter_or<double>("publish.map_leaf_size", map_leaf_size, 0.1);
+        if (map_leaf_size <= 0.0) map_leaf_size = 0.1;
+        this->get_parameter_or<int>("publish.map_max_points", map_max_points, 200000);
+        this->get_parameter_or<double>("publish.map_leaf_growth", map_leaf_growth, 1.25);
+        this->get_parameter_or<int>("publish.map_min_new_points", map_min_new_points, 1000);
+        this->get_parameter_or<double>("publish.map_min_period", map_min_period, 5.0);
+        this->get_parameter_or<double>("publish.map_max_period", map_max_period, 30.0);
+        map_max_points = std::max(map_max_points, 1000);  // the budget loop needs room to converge
+        map_leaf_growth = std::max(map_leaf_growth, 1.1); // must grow, or the budget loop never ends
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
@@ -963,7 +1053,9 @@ public:
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
-        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
+        // Transient local, so rosbridge hands a late viewer the current map.
+        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+            "/downsampled_fastlio_map", rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -994,9 +1086,27 @@ public:
     }
 
 private:
+    // Throttled: why sync_packages() has not released a scan for over 2 s.
+    void log_stall()
+    {
+        const double now = omp_get_wtime();
+        if (last_sync_wall == 0.0) last_sync_wall = now;
+        if (now - last_sync_wall < 2.0) return;
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "no scan processed for %.1f s | lidar: %zu queued, last msg %.1f s ago, stamp %.3f | "
+            "imu: %zu queued, last msg %.1f s ago, stamp %.3f | pending scan: %s, end %.3f, %+.3f s vs newest imu",
+            now - last_sync_wall,
+            lidar_buffer.size(), lidar_arrival > 0.0 ? now - lidar_arrival : -1.0, last_timestamp_lidar,
+            imu_buffer.size(), imu_arrival > 0.0 ? now - imu_arrival : -1.0, last_timestamp_imu,
+            lidar_pushed ? "yes" : "no", lidar_end_time, lidar_end_time - last_timestamp_imu);
+    }
+
     void timer_callback()
     {
-        if(sync_packages(Measures))
+        const bool synced = sync_packages(Measures);
+        if (synced) last_sync_wall = omp_get_wtime();
+        else log_stall();
+        if(synced)
         {
             if (flg_first_scan)
             {
@@ -1148,7 +1258,11 @@ private:
 
     void map_publish_callback()
     {
-        if (map_pub_en) publish_map(pubLaserCloudMap_);
+        if (!map_pub_en) return;
+        const MapStats s = publish_map(pubLaserCloudMap_);
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                             "downsampled map: %zu pts, leaf %.3f m, %.1f MB/msg, %zu sent",
+                             s.points, s.leaf, s.points * sizeof(MapPoint) / 1e6, s.sent);
     }
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
