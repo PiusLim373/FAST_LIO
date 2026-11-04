@@ -14,7 +14,7 @@ def generate_launch_description():
     package_path = get_package_share_directory('fast_lio')
     default_config_path = os.path.join(package_path, 'config')
     default_rviz_config_path = os.path.join(
-        package_path, 'rviz', 'fastlio.rviz')
+        package_path, 'rviz', 'pm01.rviz')
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     config_path = LaunchConfiguration('config_path')
@@ -31,7 +31,7 @@ def generate_launch_description():
         description='Yaml config file path'
     )
     decalre_config_file_cmd = DeclareLaunchArgument(
-        'config_file', default_value='mid360.yaml',
+        'config_file', default_value='pm01.yaml',
         description='Config file'
     )
     declare_rviz_cmd = DeclareLaunchArgument(
