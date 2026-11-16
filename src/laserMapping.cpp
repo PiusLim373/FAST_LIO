@@ -59,6 +59,7 @@
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
@@ -102,6 +103,10 @@ bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool    is_first_lidar = true;
+// ~/pause: no input while the robot does something the LiDAR can't follow (a skill), then a
+// fresh start. Only touched from the default callback group, so no locking.
+bool    flg_paused = false;
+bool    map_reset_pending = false;   // publish_map() clears its voxel map on its next call
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -284,8 +289,9 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
-void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
+void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
+    if (flg_paused) return;
     mtx_buffer.lock();
     lidar_arrival = omp_get_wtime();
     scan_count ++;
@@ -313,8 +319,9 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
 double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
-void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
+void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 {
+    if (flg_paused) return;
     mtx_buffer.lock();
     lidar_arrival = omp_get_wtime();
     double cur_time = get_time_sec(msg->header.stamp);
@@ -355,6 +362,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
+    if (flg_paused) return;
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
@@ -614,6 +622,16 @@ MapStats publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
     static bool rebuilt = false;
     static double last_pub = -1e9;
 
+    if (map_reset_pending)
+    {
+        voxels.clear();
+        ds_map.clear();
+        leaf = map_leaf_size;
+        pending = 0;
+        rebuilt = true;   // resend, so viewers drop the old map
+        map_reset_pending = false;
+    }
+
     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
     int size = laserCloudFullRes->points.size();
     PointCloudXYZI::Ptr laserCloudWorld( \
@@ -713,6 +731,55 @@ size_t save_to_pcd()
     pcl::PCDWriter pcd_writer;
     pcd_writer.writeBinary(map_file_path, snapshot);
     return snapshot.size();
+}
+
+void configure_imu(ImuProcess & imu)
+{
+    imu.set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
+    imu.set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
+    imu.set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
+    imu.set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
+    imu.set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+}
+
+// As if just launched, parameters kept: IMU init again, a new camera_init, an empty map.
+void restart_estimator()
+{
+    mtx_buffer.lock();
+    lidar_buffer.clear();
+    time_buffer.clear();
+    imu_buffer.clear();
+    lidar_pushed = false;
+    is_first_lidar = true;
+    last_timestamp_lidar = 0;
+    last_timestamp_imu = -1.0;
+    mtx_buffer.unlock();
+
+    lidar_end_time = 0;
+    first_lidar_time = 0.0;
+    lidar_mean_scantime = 0.0;
+    scan_num = 0;
+    flg_first_scan = true;
+    flg_EKF_inited = false;
+    Localmap_Initialized = false;
+    last_sync_wall = 0.0;
+
+    p_imu.reset(new ImuProcess());
+    configure_imu(*p_imu);
+    state_ikfom fresh;
+    kf.change_x(fresh);
+    state_point = kf.get_x();
+    pos_lid = state_point.pos;
+    ikdtree.Reset();
+    // The last scan before the pause would otherwise seed the new map.
+    feats_undistort->clear();
+    feats_down_body->clear();
+    feats_down_world->clear();
+    path.poses.clear();
+
+    map_reset_pending = true;
+    std::lock_guard<std::mutex> lock(mtx_pcl_wait_pub);
+    pcl_wait_pub->clear();
 }
 
 template<typename T>
@@ -1012,11 +1079,7 @@ public:
 
         Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
         Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
-        p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
-        p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
-        p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
-        p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
-        p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+        configure_imu(*p_imu);
 
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
@@ -1074,6 +1137,8 @@ public:
         // service gains concurrency. Requires the MultiThreadedExecutor in main().
         save_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2), rclcpp::ServicesQoS(), save_cb_group_);
+        // Default group: never runs during a scan or a sensor callback.
+        pause_srv_ = this->create_service<std_srvs::srv::SetBool>("~/pause", std::bind(&LaserMappingNode::pause_callback, this, std::placeholders::_1, std::placeholders::_2));
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -1103,6 +1168,7 @@ private:
 
     void timer_callback()
     {
+        if (flg_paused) return;
         const bool synced = sync_packages(Measures);
         if (synced) last_sync_wall = omp_get_wtime();
         else log_stall();
@@ -1258,7 +1324,8 @@ private:
 
     void map_publish_callback()
     {
-        if (!map_pub_en) return;
+        // Paused, the last scan would be added again every second.
+        if (!map_pub_en || flg_paused) return;
         const MapStats s = publish_map(pubLaserCloudMap_);
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
                              "downsampled map: %zu pts, leaf %.3f m, %.1f MB/msg, %zu sent",
@@ -1292,6 +1359,32 @@ private:
         }
     }
 
+    // true: drop all input; false: start fresh (new camera_init, empty map).
+    void pause_callback(std_srvs::srv::SetBool::Request::ConstSharedPtr req, std_srvs::srv::SetBool::Response::SharedPtr res)
+    {
+        if (req->data)
+        {
+            flg_paused = true;
+            mtx_buffer.lock();
+            lidar_buffer.clear();
+            time_buffer.clear();
+            imu_buffer.clear();
+            lidar_pushed = false;
+            mtx_buffer.unlock();
+            RCLCPP_INFO(this->get_logger(), "Paused: input dropped until restarted");
+            res->message = "paused";
+        }
+        else
+        {
+            if (map_pub_en) RCLCPP_WARN(this->get_logger(), "Restart clears the map in progress");
+            restart_estimator();
+            flg_paused = false;
+            RCLCPP_INFO(this->get_logger(), "Restarted fresh");
+            res->message = "restarted";
+        }
+        res->success = true;
+    }
+
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
@@ -1308,6 +1401,7 @@ private:
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::CallbackGroup::SharedPtr save_cb_group_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+    rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr pause_srv_;
 
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
